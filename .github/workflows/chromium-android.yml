@@ -1,0 +1,120 @@
+name: Build Chromium for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: "Chromium GN/Ninja target"
+        required: true
+        default: "chrome_public_apk"
+        type: choice
+        options:
+          - chrome_public_apk
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chromium-android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Full Chromium builds need a dedicated, high-capacity runner.
+    # Configure this runner yourself; GitHub-hosted runners are not sufficient.
+    runs-on: [self-hosted, linux, x64, chromium-build]
+    timeout-minutes: 360
+    env:
+      DEPOT_TOOLS_UPDATE: "0"
+      DEPOT_TOOLS_METRICS: "0"
+      CHROMIUM_SRC: ${{ github.workspace }}/src
+      OUT_DIR: ${{ github.workspace }}/src/out/Android
+
+    steps:
+      - name: Check runner capacity and tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          df -h .
+          free -h
+          command -v git
+          command -v python3
+          command -v java
+          test "$(uname -m)" = "x86_64"
+          available_gb="$(df -BG . | awk 'NR==2 {gsub(/G/, "", $4); print $4}')"
+          if [ "${available_gb}" -lt 180 ]; then
+            echo "::error::At least 180 GB free disk space is required before fetching Chromium."
+            exit 1
+          fi
+
+      - name: Install or update depot_tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -d "${RUNNER_TEMP}/depot_tools/.git" ]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "${RUNNER_TEMP}/depot_tools"
+          else
+            git -C "${RUNNER_TEMP}/depot_tools" pull --ff-only
+          fi
+          echo "${RUNNER_TEMP}/depot_tools" >> "$GITHUB_PATH"
+          echo "DEPOT_TOOLS_DIR=${RUNNER_TEMP}/depot_tools" >> "$GITHUB_ENV"
+
+      - name: Fetch Chromium Android source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -d "${CHROMIUM_SRC}/.git" ]; then
+            mkdir -p "${CHROMIUM_SRC}"
+            cd "${CHROMIUM_SRC}"
+            fetch --nohooks android
+          else
+            cd "${CHROMIUM_SRC}"
+            git status --short
+          fi
+
+      - name: Synchronize dependencies
+        working-directory: ${{ github.workspace }}/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gclient sync -D
+
+      - name: Install Android build dependencies
+        working-directory: ${{ github.workspace }}/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./build/install-build-deps-android.sh --no-prompt
+
+      - name: Run Chromium hooks
+        working-directory: ${{ github.workspace }}/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gclient runhooks
+
+      - name: Generate ARM64 release build
+        working-directory: ${{ github.workspace }}/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gn gen "${OUT_DIR}" --args='target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0'
+          gn args "${OUT_DIR}" --list
+
+      - name: Compile Chromium APK
+        working-directory: ${{ github.workspace }}/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          autoninja -C "${OUT_DIR}" "${{ inputs.build_target }}"
+          find "${OUT_DIR}" -type f -name 'ChromePublic.apk' -print
+
+      - name: Upload Chromium APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-android-arm64
+          path: ${{ github.workspace }}/src/out/Android/apks/ChromePublic.apk
+          if-no-files-found: error
+          retention-days: 7

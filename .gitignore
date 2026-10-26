@@ -1,0 +1,5 @@
+# Chromium checkout and generated build output
+/src/
+/depot_tools/
+/out/
+/*.log
